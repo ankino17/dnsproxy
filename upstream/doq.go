@@ -106,6 +106,11 @@ func newDoQ(addr *url.URL, opts *Options) (u Upstream, err error) {
 			KeepAlivePeriod: QUICKeepAlivePeriod,
 			TokenStore:      newQUICTokenStore(),
 			Tracer:          opts.QUICTracer,
+			MaxIdleTimeout:  1 * time.Hour,
+			//InitialStreamReceiveWindow:     2048,
+			//MaxStreamReceiveWindow:         65536,
+			//InitialConnectionReceiveWindow: 2048,
+			//MaxConnectionReceiveWindow:     1048576,
 		},
 		tlsConf: &tls.Config{
 			ServerName:   addr.Hostname(),
@@ -118,10 +123,11 @@ func newDoQ(addr *url.URL, opts *Options) (u Upstream, err error) {
 			MinVersion:         tls.VersionTLS12,
 			// #nosec G402 -- TLS certificate verification could be disabled by
 			// configuration.
-			InsecureSkipVerify:    opts.InsecureSkipVerify,
-			VerifyPeerCertificate: opts.VerifyServerCertificate,
-			VerifyConnection:      opts.VerifyConnection,
-			NextProtos:            compatProtoDQ,
+			InsecureSkipVerify:     opts.InsecureSkipVerify,
+			VerifyPeerCertificate:  opts.VerifyServerCertificate,
+			VerifyConnection:       opts.VerifyConnection,
+			NextProtos:             compatProtoDQ,
+			SessionTicketsDisabled: false,
 		},
 		quicConfigMu: &sync.Mutex{},
 		connMu:       &sync.Mutex{},
