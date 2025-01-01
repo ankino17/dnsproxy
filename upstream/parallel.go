@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"fmt"
+	"log/slog"
 	"slices"
 
 	"github.com/AdguardTeam/golibs/errors"
@@ -19,7 +20,7 @@ const (
 
 // ExchangeParallel returns the first successful response from one of u.  It
 // returns an error if all upstreams failed to exchange the request.
-func ExchangeParallel(ups []Upstream, req *dns.Msg) (reply *dns.Msg, resolved Upstream, err error) {
+func ExchangeParallel(ups []Upstream, req *dns.Msg, l *slog.Logger) (reply *dns.Msg, resolved Upstream, err error) {
 	upsNum := len(ups)
 	switch upsNum {
 	case 0:
@@ -51,6 +52,13 @@ func ExchangeParallel(ups []Upstream, req *dns.Msg) (reply *dns.Msg, resolved Up
 				errs = append(errs, err)
 			}
 		} else {
+			if len(r.Resp.Answer) == 0 || r.Resp.MsgHdr.Rcode == dns.RcodeServerFailure {
+				//if r.Resp.MsgHdr.Rcode == dns.RcodeServerFailure {
+				//errs = append(errs, errors.Error("Upstream %s reply SERVFAIL"))
+				l.Warn("dnsproxy: upstream %s reply SERVFAIL or answer is empty", r.Upstream.Address())
+
+				continue
+			}
 			return r.Resp, r.Upstream, nil
 		}
 	}

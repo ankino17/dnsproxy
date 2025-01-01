@@ -577,7 +577,7 @@ func (p *Proxy) replyFromUpstream(d *DNSContext) (ok bool, err error) {
 		// creating proxy.
 		upstreams = p.Fallbacks.getUpstreamsForDomain(req.Question[0].Name)
 
-		resp, u, err = upstream.ExchangeParallel(upstreams, req)
+		resp, u, err = upstream.ExchangeParallel(upstreams, req, p.logger)
 	}
 
 	if err != nil {
