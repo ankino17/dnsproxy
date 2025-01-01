@@ -105,6 +105,11 @@ func newDoH(addr *url.URL, opts *Options) (u Upstream, err error) {
 			KeepAlivePeriod: QUICKeepAlivePeriod,
 			TokenStore:      newQUICTokenStore(),
 			Tracer:          opts.QUICTracer,
+			MaxIdleTimeout:  1 * time.Hour,
+			//InitialStreamReceiveWindow:     2048,
+			//MaxStreamReceiveWindow:		65536,
+			//InitialConnectionReceiveWindow: 2048,
+			//MaxConnectionReceiveWindow:	1048576,
 		},
 		quicConfMu: &sync.Mutex{},
 		tlsConf: &tls.Config{
@@ -118,9 +123,10 @@ func newDoH(addr *url.URL, opts *Options) (u Upstream, err error) {
 			MinVersion:         tls.VersionTLS12,
 			// #nosec G402 -- TLS certificate verification could be disabled by
 			// configuration.
-			InsecureSkipVerify:    opts.InsecureSkipVerify,
-			VerifyPeerCertificate: opts.VerifyServerCertificate,
-			VerifyConnection:      opts.VerifyConnection,
+			InsecureSkipVerify:     opts.InsecureSkipVerify,
+			VerifyPeerCertificate:  opts.VerifyServerCertificate,
+			VerifyConnection:       opts.VerifyConnection,
+			SessionTicketsDisabled: false,
 		},
 		clientMu:     &sync.Mutex{},
 		logger:       opts.Logger,
@@ -464,7 +470,7 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 		TLSClientConfig:    tlsConf,
 		DisableCompression: true,
 		DialContext:        dialContext,
-		IdleConnTimeout:    transportDefaultIdleConnTimeout,
+		IdleConnTimeout:    0,
 		MaxConnsPerHost:    dohMaxConnsPerHost,
 		MaxIdleConns:       dohMaxIdleConns,
 		// Since we have a custom DialContext, we need to use this field to make
@@ -482,7 +488,7 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 	}
 
 	// Enable HTTP/2 pings on idle connections.
-	p.transportH2.ReadIdleTimeout = transportDefaultReadIdleTimeout
+	p.transportH2.ReadIdleTimeout = 0
 
 	return transport, nil
 }
