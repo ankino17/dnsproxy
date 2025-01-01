@@ -127,6 +127,9 @@ func NewDialContext(timeout time.Duration, l *slog.Logger, addrs ...string) (h D
 
 				continue
 			}
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				tcp.SetKeepAlive(false)
+			}
 
 			a.DebugContext(ctx, "connection succeeded", "elapsed", elapsed)
 
