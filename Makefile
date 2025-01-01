@@ -22,7 +22,7 @@ VERBOSE.MACRO = $${VERBOSE:-0}
 
 BRANCH = $${BRANCH:-$$(git rev-parse --abbrev-ref HEAD)}
 DIST_DIR = build
-GOAMD64 = v1
+GOAMD64 = v3
 GOPROXY = https://proxy.golang.org|direct
 GOTOOLCHAIN = go1.23.4
 GOTELEMETRY = off
