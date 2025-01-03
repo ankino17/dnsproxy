@@ -52,10 +52,10 @@ func ExchangeParallel(ups []Upstream, req *dns.Msg, l *slog.Logger) (reply *dns.
 				errs = append(errs, err)
 			}
 		} else {
-			if len(r.Resp.Answer) == 0 || r.Resp.MsgHdr.Rcode == dns.RcodeServerFailure {
+			if r.Resp.MsgHdr.Rcode == dns.RcodeServerFailure {
 				//if r.Resp.MsgHdr.Rcode == dns.RcodeServerFailure {
 				//errs = append(errs, errors.Error("Upstream %s reply SERVFAIL"))
-				l.Warn("dnsproxy: upstream %s reply SERVFAIL or answer is empty", r.Upstream.Address())
+				l.Warn("upstream reply SERVFAIL", "upstream", r.Upstream.Address(), "question", req.Question)
 
 				continue
 			}
