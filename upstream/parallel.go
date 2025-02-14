@@ -3,6 +3,7 @@ package upstream
 import (
 	"fmt"
 	"log/slog"
+	"net/url"
 	"slices"
 
 	"github.com/AdguardTeam/golibs/errors"
@@ -44,6 +45,7 @@ func ExchangeParallel(ups []Upstream, req *dns.Msg, l *slog.Logger) (reply *dns.
 	}
 
 	errs := []error{}
+	servfailErrs := []string{}
 	for range ups {
 		var r *ExchangeAllResult
 		r, err = receiveAsyncResult(resCh)
@@ -55,12 +57,17 @@ func ExchangeParallel(ups []Upstream, req *dns.Msg, l *slog.Logger) (reply *dns.
 			if r.Resp.MsgHdr.Rcode == dns.RcodeServerFailure {
 				//if r.Resp.MsgHdr.Rcode == dns.RcodeServerFailure {
 				//errs = append(errs, errors.Error("Upstream %s reply SERVFAIL"))
-				l.Warn("upstream reply SERVFAIL", "upstream", r.Upstream.Address(), "question", req.Question)
+				u, _ := url.Parse(r.Upstream.Address())
+				servfailErrs = append(servfailErrs, u.Host)
 
 				continue
 			}
 			return r.Resp, r.Upstream, nil
 		}
+	}
+
+	if len(servfailErrs) != 0 {
+		l.Warn("upstream reply SERVFAIL", "upstream", servfailErrs, "question", req.Question)
 	}
 
 	// TODO(e.burkov):  Probably it's better to return the joined error from
