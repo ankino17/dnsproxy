@@ -121,7 +121,7 @@ func (p *plainDNS) dialExchange(
 	}
 
 	if err != nil {
-		return resp, fmt.Errorf("exchanging with %s over %s: %w", addr, network, err)
+		return resp, fmt.Errorf("query host %s with %s over %s: %w", req.Question[0].String(), addr, network, err)
 	}
 
 	return resp, validatePlainResponse(req, resp)
