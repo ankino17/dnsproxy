@@ -27,9 +27,7 @@ func ExchangeParallel(ups []Upstream, req *dns.Msg, l *slog.Logger) (reply *dns.
 	case 0:
 		return nil, nil, ErrNoUpstreams
 	case 1:
-		reply, err = ups[0].Exchange(req)
-
-		return reply, ups[0], err
+		return exchangeSingle(ups[0], req)
 	default:
 		// Go on.
 	}
@@ -78,6 +76,20 @@ func ExchangeParallel(ups []Upstream, req *dns.Msg, l *slog.Logger) (reply *dns.
 	}
 
 	return nil, nil, errors.Join(errs...)
+}
+
+// exchangeSingle returns a successful response and resolver if a DNS lookup was
+// successful.
+func exchangeSingle(
+	ups Upstream,
+	req *dns.Msg,
+) (resp *dns.Msg, resolved Upstream, err error) {
+	resp, err = ups.Exchange(req)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return resp, ups, err
 }
 
 // ExchangeAllResult is the successful result of [ExchangeAll] for a single
