@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -100,7 +101,7 @@ func TestUpstreamDoH(t *testing.T) {
 				checkUpstream(t, u, address)
 			}
 
-			doh := u.(*dnsOverHTTPS)
+			doh := testutil.RequireTypeAssert[*dnsOverHTTPS](t, u)
 
 			// Trigger re-connection.
 			doh.client = nil
@@ -287,7 +288,7 @@ func TestUpstreamDoH_0RTT(t *testing.T) {
 	require.NoError(t, err)
 	testutil.CleanupAndRequireSuccess(t, u.Close)
 
-	uh := u.(*dnsOverHTTPS)
+	uh := testutil.RequireTypeAssert[*dnsOverHTTPS](t, u)
 	req := createTestMessage()
 
 	// Trigger connection to a DoH3 server.
@@ -392,6 +393,7 @@ func startDoHServer(
 	server := &http.Server{
 		Handler:     handler,
 		ReadTimeout: time.Second,
+		ErrorLog:    slog.NewLogLogger(slog.DiscardHandler, slog.LevelDebug),
 	}
 
 	// Listen TCP first.
@@ -419,7 +421,7 @@ func startDoHServer(
 	}()
 
 	// Get the real address that the listener now listens to.
-	tcpAddr = tcpListen.Addr().(*net.TCPAddr)
+	tcpAddr = testutil.RequireTypeAssert[*net.TCPAddr](t, tcpListen.Addr())
 
 	var serverH3 *http3.Server
 	var listenerH3 *quic.EarlyListener

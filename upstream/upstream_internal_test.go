@@ -13,10 +13,12 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/testutil"
@@ -28,8 +30,11 @@ import (
 
 // TODO(ameshkov): Make tests here not depend on external servers.
 
-// TODO(d.kolyshev): Remove this after migrating dnscrypt to slog.
+// TODO(d.kolyshev): Remove this after quic-go has migrated to slog.
 func TestMain(m *testing.M) {
+	// See https://github.com/quic-go/quic-go/issues/4228.
+	errors.Check(os.Setenv("QUIC_GO_DISABLE_GSO", "1"))
+
 	testutil.DiscardLogOutput(m)
 }
 
@@ -591,14 +596,14 @@ func TestAddPort(t *testing.T) {
 }
 
 // checkUpstream sends a test message to the upstream and checks the result.
-func checkUpstream(t *testing.T, u Upstream, addr string) {
-	t.Helper()
+func checkUpstream(tb testing.TB, u Upstream, addr string) {
+	tb.Helper()
 
 	req := createTestMessage()
 	reply, err := u.Exchange(req)
-	require.NoErrorf(t, err, "couldn't talk to upstream %s", addr)
+	require.NoErrorf(tb, err, "couldn't talk to upstream %s", addr)
 
-	requireResponse(t, req, reply)
+	requireResponse(tb, req, reply)
 }
 
 // checkRaceCondition runs several goroutines in parallel and each of them calls

@@ -12,6 +12,7 @@ import (
 	"github.com/AdguardTeam/dnsproxy/proxyutil"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/testutil"
+	"github.com/AdguardTeam/golibs/testutil/servicetest"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 	"github.com/stretchr/testify/require"
@@ -42,10 +43,7 @@ func TestQuicProxy(t *testing.T) {
 	t.Run("run", func(t *testing.T) {
 		dnsProxy := mustNew(t, conf)
 
-		ctx := context.Background()
-		err := dnsProxy.Start(ctx)
-		require.NoError(t, err)
-		testutil.CleanupAndRequireSuccess(t, func() (err error) { return dnsProxy.Shutdown(ctx) })
+		servicetest.RequireRun(t, dnsProxy, testTimeout)
 
 		addr = testutil.RequireTypeAssert[*net.UDPAddr](t, dnsProxy.Addr(ProtoQUIC))
 
@@ -70,10 +68,7 @@ func TestQuicProxy(t *testing.T) {
 	t.Run("rerun", func(t *testing.T) {
 		dnsProxy := mustNew(t, conf)
 
-		ctx := context.Background()
-		err := dnsProxy.Start(ctx)
-		require.NoError(t, err)
-		testutil.CleanupAndRequireSuccess(t, func() (err error) { return dnsProxy.Shutdown(ctx) })
+		servicetest.RequireRun(t, dnsProxy, testTimeout)
 
 		conn, err := quic.DialAddrEarly(context.Background(), addr.String(), tlsConfig, nil)
 		require.NoError(t, err)
@@ -118,11 +113,7 @@ func TestQuicProxy_largePackets(t *testing.T) {
 		},
 	})
 
-	// Start listening.
-	ctx := context.Background()
-	err := dnsProxy.Start(ctx)
-	require.NoError(t, err)
-	testutil.CleanupAndRequireSuccess(t, func() (err error) { return dnsProxy.Shutdown(ctx) })
+	servicetest.RequireRun(t, dnsProxy, testTimeout)
 
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM(caPem)
@@ -161,7 +152,7 @@ func TestQuicProxy_largePackets(t *testing.T) {
 func sendQUICMessage(
 	t *testing.T,
 	msg *dns.Msg,
-	conn quic.Connection,
+	conn *quic.Conn,
 	doqVersion DoQVersion,
 ) (resp *dns.Msg) {
 	// Open a new QUIC stream to write there a test DNS query.
@@ -207,7 +198,7 @@ func sendQUICMessage(
 
 // writeQUICStream writes buf to the specified QUIC stream in chunks.  This way
 // it is possible to test how the server deals with chunked DNS messages.
-func writeQUICStream(buf []byte, stream quic.Stream) (err error) {
+func writeQUICStream(buf []byte, stream *quic.Stream) (err error) {
 	// Send the DNS query to the stream and split it into chunks of up
 	// to 400 bytes.  400 is an arbitrary chosen value.
 	chunkSize := 400
@@ -233,7 +224,7 @@ func writeQUICStream(buf []byte, stream quic.Stream) (err error) {
 }
 
 // sendTestQUICMessage send a test message to the specified QUIC connection.
-func sendTestQUICMessage(t *testing.T, conn quic.Connection, doqVersion DoQVersion) {
+func sendTestQUICMessage(t *testing.T, conn *quic.Conn, doqVersion DoQVersion) {
 	msg := newTestMessage()
 	resp := sendQUICMessage(t, msg, conn, doqVersion)
 	requireResponse(t, msg, resp)
