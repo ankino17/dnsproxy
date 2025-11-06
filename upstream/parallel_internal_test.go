@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
@@ -24,7 +23,7 @@ func TestExchangeParallel(t *testing.T) {
 
 	for _, s := range upstreamList {
 		u, err := AddressToUpstream(s, &Options{
-			Logger:  slogutil.NewDiscardLogger(),
+			Logger:  testLogger,
 			Timeout: timeout,
 		})
 		if err != nil {
@@ -142,7 +141,6 @@ func TestExchangeAll(t *testing.T) {
 	resp := res[0].Resp
 	require.NotNil(t, resp)
 	require.NotEmpty(t, resp.Answer)
-	require.IsType(t, new(dns.A), resp.Answer[0])
 
 	ip := testutil.RequireTypeAssert[*dns.A](t, resp.Answer[0]).A
 	assert.Equal(t, ansAddr.AsSlice(), []byte(ip))
@@ -150,7 +148,6 @@ func TestExchangeAll(t *testing.T) {
 	resp = res[1].Resp
 	require.NotNil(t, resp)
 	require.NotEmpty(t, resp.Answer)
-	require.IsType(t, new(dns.A), resp.Answer[0])
 
 	ip = testutil.RequireTypeAssert[*dns.A](t, resp.Answer[0]).A
 	assert.Equal(t, delayedAnsAddr.AsSlice(), []byte(ip))
