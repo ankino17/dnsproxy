@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,7 +29,6 @@ import (
 	"github.com/AdguardTeam/golibs/validate"
 	"github.com/ameshkov/dnscrypt/v2"
 	"github.com/miekg/dns"
-	gocache "github.com/patrickmn/go-cache"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -92,14 +90,15 @@ type Proxy struct {
 	// beforeRequestHandler handles the request's context before it is resolved.
 	beforeRequestHandler BeforeRequestHandler
 
+	// requestHandler handles the DNS request after it's been processed by the
+	// beforeRequestHandler.  It is never nil.
+	requestHandler Handler
+
 	// dnsCryptServer serves DNSCrypt queries.
 	dnsCryptServer *dnscrypt.Server
 
 	// logger is used for logging in the proxy service.  It is never nil.
 	logger *slog.Logger
-
-	// ratelimitBuckets is a storage for ratelimiters for individual IPs.
-	ratelimitBuckets *gocache.Cache
 
 	// fastestAddr finds the fastest IP address for the resolved domain.
 	fastestAddr *fastip.FastestAddr
@@ -199,9 +198,6 @@ type Proxy struct {
 	// Also make it a pointer.
 	sync.RWMutex
 
-	// ratelimitLock protects ratelimitBuckets.
-	ratelimitLock sync.Mutex
-
 	// rttLock protects upstreamRTTStats.
 	//
 	// TODO(e.burkov):  Make it a pointer.
@@ -227,9 +223,9 @@ func New(c *Config) (p *Proxy, err error) {
 			c.BeforeRequestHandler,
 			noopRequestHandler{},
 		),
+		requestHandler:   cmp.Or[Handler](c.RequestHandler, DefaultHandler{}),
 		upstreamRTTStats: map[string]upstreamRTTStats{},
 		rttLock:          sync.Mutex{},
-		ratelimitLock:    sync.Mutex{},
 		RWMutex:          sync.RWMutex{},
 		// 2 bytes may be used to store packet length (see TCP/TLS).
 		bytesPool:  syncutil.NewSlicePool[byte](2 + dns.MaxMsgSize),
@@ -250,6 +246,9 @@ func New(c *Config) (p *Proxy, err error) {
 	if err != nil {
 		return nil, err
 	}
+
+	p.CacheOptimisticAnswerTTL = cmp.Or(p.CacheOptimisticAnswerTTL, DefaultOptimisticAnswerTTL)
+	p.CacheOptimisticMaxAge = cmp.Or(p.CacheOptimisticMaxAge, DefaultOptimisticMaxAge)
 
 	p.initCache()
 
@@ -278,10 +277,6 @@ func New(c *Config) (p *Proxy, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("setting up DNS64: %w", err)
 	}
-
-	// TODO(e.burkov):  Clone all mutable fields of Config.
-	p.RatelimitWhitelist = slices.Clone(p.RatelimitWhitelist)
-	slices.SortFunc(p.RatelimitWhitelist, netip.Addr.Compare)
 
 	return p, nil
 }
@@ -748,11 +743,39 @@ func (p *Proxy) Resolve(dctx *DNSContext) (err error) {
 	// Complete the response.
 	dctx.scrub()
 
-	if p.ResponseHandler != nil {
-		p.ResponseHandler(dctx, err)
-	}
-
 	return err
+}
+
+// validateRequest returns a response for invalid request or nil if the request
+// is ok.
+func (p *Proxy) validateRequest(d *DNSContext) (resp *dns.Msg) {
+	switch {
+	case len(d.Req.Question) != 1:
+		p.logger.Debug("invalid number of questions", "req_questions_len", len(d.Req.Question))
+
+		// TODO(e.burkov):  Probably, FORMERR would be a better choice here.
+		// Check out RFC.
+		return p.messages.NewMsgSERVFAIL(d.Req)
+	case p.RefuseAny && d.Req.Question[0].Qtype == dns.TypeANY:
+		// Refuse requests of type ANY (anti-DDOS measure).
+		p.logger.Debug("refusing dns type any request")
+
+		return p.messages.NewMsgNOTIMPLEMENTED(d.Req)
+	case p.recDetector.check(d.Req):
+		p.logger.Debug("recursion detected", "req_question", d.Req.Question[0].Name)
+
+		return p.messages.NewMsgNXDOMAIN(d.Req)
+	case d.isForbiddenARPA(p.privateNets, p.logger):
+		p.logger.Debug(
+			"private arpa domain is requested",
+			"addr", d.Addr,
+			"arpa", d.Req.Question[0].Name,
+		)
+
+		return p.messages.NewMsgNXDOMAIN(d.Req)
+	default:
+		return nil
+	}
 }
 
 // cacheWorks returns true if the cache works for the given context.  If not, it

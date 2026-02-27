@@ -18,23 +18,15 @@ import (
 // LogPrefix is a prefix for logging.
 const LogPrefix = "dnsproxy"
 
-// RequestHandler is an optional custom handler for DNS requests.  It's used
-// instead of [Proxy.Resolve] if set.  The resulting error doesn't affect the
-// request processing.  The custom handler is responsible for calling
-// [ResponseHandler], if it doesn't call [Proxy.Resolve].
-//
-// TODO(e.burkov):  Use the same interface-based approach as
-// [BeforeRequestHandler].
-type RequestHandler func(p *Proxy, dctx *DNSContext) (err error)
+const (
+	// DefaultOptimisticMaxAge is default value for
+	// [Config.CacheOptimisticMaxAge].
+	DefaultOptimisticMaxAge = 12 * time.Hour
 
-// ResponseHandler is an optional custom handler called when DNS query has been
-// processed.  When called from [Proxy.Resolve], dctx will contain the response
-// message if the upstream or cache succeeded.  err is only not nil if the
-// upstream failed to respond.
-//
-// TODO(e.burkov):  Use the same interface-based approach as
-// [BeforeRequestHandler].
-type ResponseHandler func(dctx *DNSContext, err error)
+	// DefaultOptimisticAnswerTTL is default value for
+	// [Config.CacheOptimisticAnswerTTL].
+	DefaultOptimisticAnswerTTL = 30 * time.Second
+)
 
 // Config contains all the fields necessary for proxy configuration.
 //
@@ -69,12 +61,9 @@ type Config struct {
 	BeforeRequestHandler BeforeRequestHandler
 
 	// RequestHandler is an optional custom handler for DNS requests.  It's used
-	// instead of [Proxy.Resolve] if set.  See [RequestHandler].
-	RequestHandler RequestHandler
-
-	// ResponseHandler is an optional custom handler called when DNS query has
-	// been processed.  See [ResponseHandler].
-	ResponseHandler ResponseHandler
+	// instead of DefaultHandler if set.  In case of [ErrDrop] error returned
+	// from this handler, the proxy will not send any response to the client.
+	RequestHandler Handler
 
 	// UpstreamConfig is a general set of DNS servers to forward requests to.
 	UpstreamConfig *UpstreamConfig
@@ -159,25 +148,8 @@ type Config struct {
 	// default Well-Known Prefix.
 	DNS64Prefs []netip.Prefix
 
-	// RatelimitWhitelist is a list of IP addresses excluded from rate limiting.
-	RatelimitWhitelist []netip.Addr
-
 	// EDNSAddr is the ECS IP used in request.
 	EDNSAddr net.IP
-
-	// TODO(s.chzhen):  Extract ratelimit settings to a separate structure.
-
-	// RatelimitSubnetLenIPv4 is a subnet length for IPv4 addresses used for
-	// rate limiting requests.
-	RatelimitSubnetLenIPv4 int
-
-	// RatelimitSubnetLenIPv6 is a subnet length for IPv6 addresses used for
-	// rate limiting requests.
-	RatelimitSubnetLenIPv6 int
-
-	// Ratelimit is a maximum number of requests per second from a given IP (0
-	// to disable).
-	Ratelimit int
 
 	// CacheSizeBytes is the maximum cache size in bytes.
 	CacheSizeBytes int
@@ -187,6 +159,14 @@ type Config struct {
 
 	// CacheMaxTTL is the maximum TTL for cached DNS responses in seconds.
 	CacheMaxTTL uint32
+
+	// CacheOptimisticAnswerTTL is the default TTL for expired cached responses.
+	// Default value is [DefaultOptimisticAnswerTTL].
+	CacheOptimisticAnswerTTL time.Duration
+
+	// CacheOptimisticMaxAge is the maximum time entries remain in the cache
+	// when cache is optimistic.  Default value is [DefaultOptimisticMaxAge].
+	CacheOptimisticMaxAge time.Duration
 
 	// MaxGoroutines is the maximum number of goroutines processing DNS
 	// requests.  Important for mobile users.
@@ -286,11 +266,6 @@ func (p *Proxy) validateConfig() (err error) {
 		return fmt.Errorf("fallbacks: %w", err)
 	}
 
-	err = p.validateRatelimit()
-	if err != nil {
-		return fmt.Errorf("ratelimit: %w", err)
-	}
-
 	switch p.UpstreamMode {
 	case
 		"",
@@ -312,55 +287,10 @@ func (p *Proxy) validateConfig() (err error) {
 	return nil
 }
 
-// validateRatelimit validates ratelimit configuration and returns an error if
-// it's invalid.
-func (p *Proxy) validateRatelimit() (err error) {
-	if p.Ratelimit == 0 {
-		return nil
-	}
-
-	err = checkInclusion(p.RatelimitSubnetLenIPv4, 0, netutil.IPv4BitLen)
-	if err != nil {
-		return fmt.Errorf("ratelimit subnet len ipv4 is invalid: %w", err)
-	}
-
-	err = checkInclusion(p.RatelimitSubnetLenIPv6, 0, netutil.IPv6BitLen)
-	if err != nil {
-		return fmt.Errorf("ratelimit subnet len ipv6 is invalid: %w", err)
-	}
-
-	return nil
-}
-
-// checkInclusion returns an error if a n is not in the inclusive range between
-// minN and maxN.
-func checkInclusion(n, minN, maxN int) (err error) {
-	switch {
-	case n < minN:
-		return fmt.Errorf("value %d less than min %d", n, minN)
-	case n > maxN:
-		return fmt.Errorf("value %d greater than max %d", n, maxN)
-	}
-
-	return nil
-}
-
 // logConfigInfo logs proxy configuration information.
 func (p *Proxy) logConfigInfo() {
 	if p.CacheMinTTL > 0 || p.CacheMaxTTL > 0 {
 		p.logger.Info("cache ttl override is enabled", "min", p.CacheMinTTL, "max", p.CacheMaxTTL)
-	}
-
-	if p.Ratelimit > 0 {
-		p.logger.Info(
-			"ratelimit is enabled",
-			"rps",
-			p.Ratelimit,
-			"ipv4_subnet_mask_len",
-			p.RatelimitSubnetLenIPv4,
-			"ipv6_subnet_mask_len",
-			p.RatelimitSubnetLenIPv6,
-		)
 	}
 
 	if p.RefuseAny {

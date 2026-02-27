@@ -13,9 +13,10 @@ import (
 	"time"
 
 	"github.com/AdguardTeam/dnsproxy/internal/dnsmsg"
-	"github.com/AdguardTeam/dnsproxy/internal/handler"
+	"github.com/AdguardTeam/dnsproxy/internal/middleware"
 	proxynetutil "github.com/AdguardTeam/dnsproxy/internal/netutil"
 	"github.com/AdguardTeam/dnsproxy/proxy"
+	"github.com/AdguardTeam/dnsproxy/ratelimit"
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
@@ -39,33 +40,35 @@ func createProxyConfig(
 		return nil, err
 	}
 
-	hosts, err := handler.ReadHosts(ctx, l, hostsFiles)
+	hosts, err := middleware.ReadHosts(ctx, l, hostsFiles)
 	if err != nil {
 		return nil, fmt.Errorf("reading hosts files: %w", err)
 	}
 
-	reqHdlr := handler.NewDefault(&handler.DefaultConfig{
-		Logger: l.With(slogutil.KeyPrefix, "default_handler"),
+	preMw := middleware.New(&middleware.Config{
+		Logger: l.With(slogutil.KeyPrefix, "pre_handler_mw"),
 		// TODO(e.burkov):  Use the configured message constructor.
 		MessageConstructor: dnsmsg.DefaultMessageConstructor{},
 		HaltIPv6:           conf.IPv6Disabled,
 		HostsFiles:         hosts,
 	})
 
+	ratelimitMw, err := conf.newRatelimitMw(l)
+	if err != nil {
+		return nil, fmt.Errorf("ratelimit mw: %w", err)
+	}
+
 	proxyConf = &proxy.Config{
-		Logger: l.With(slogutil.KeyPrefix, proxy.LogPrefix),
-
-		RatelimitSubnetLenIPv4: conf.RatelimitSubnetLenIPv4,
-		RatelimitSubnetLenIPv6: conf.RatelimitSubnetLenIPv6,
-
-		Ratelimit:       conf.Ratelimit,
-		CacheEnabled:    conf.Cache,
-		CacheSizeBytes:  conf.CacheSizeBytes,
-		CacheMinTTL:     conf.CacheMinTTL,
-		CacheMaxTTL:     conf.CacheMaxTTL,
-		CacheOptimistic: conf.CacheOptimistic,
-		RefuseAny:       conf.RefuseAny,
-		HTTP3:           conf.HTTP3,
+		Logger:                   l.With(slogutil.KeyPrefix, proxy.LogPrefix),
+		CacheEnabled:             conf.Cache,
+		CacheSizeBytes:           conf.CacheSizeBytes,
+		CacheMinTTL:              conf.CacheMinTTL,
+		CacheMaxTTL:              conf.CacheMaxTTL,
+		CacheOptimisticAnswerTTL: time.Duration(conf.OptimisticAnswerTTL),
+		CacheOptimisticMaxAge:    time.Duration(conf.OptimisticMaxAge),
+		CacheOptimistic:          conf.CacheOptimistic,
+		RefuseAny:                conf.RefuseAny,
+		HTTP3:                    conf.HTTP3,
 		// TODO(e.burkov):  The following CIDRs are aimed to match any address.
 		// This is not quite proper approach to be used by default so think
 		// about configuring it.
@@ -79,7 +82,7 @@ func createProxyConfig(
 		MaxGoroutines:          conf.MaxGoRoutines,
 		UsePrivateRDNS:         conf.UsePrivateRDNS,
 		PrivateSubnets:         netutil.SubnetSetFunc(netutil.IsLocallyServed),
-		RequestHandler:         reqHdlr.HandleRequest,
+		RequestHandler:         ratelimitMw.Wrap(preMw.Wrap(proxy.DefaultHandler{})),
 		PendingRequests: &proxy.PendingRequestsConfig{
 			Enabled: conf.PendingRequestsEnabled,
 		},
@@ -116,6 +119,26 @@ func isEmpty(uc *proxy.UpstreamConfig) (ok bool) {
 	return len(uc.Upstreams) == 0 &&
 		len(uc.DomainReservedUpstreams) == 0 &&
 		len(uc.SpecifiedDomainUpstreams) == 0
+}
+
+// newRatelimitMw returns the ratelimit middleware.  In case of invalid
+// ratelimit configuration returns an error. l must not be nil.
+func (conf *configuration) newRatelimitMw(l *slog.Logger) (mw proxy.Middleware, err error) {
+	if conf.Ratelimit == 0 {
+		return proxy.MiddlewareFunc(proxy.PassThrough), nil
+	}
+
+	rlConf := &ratelimit.Config{
+		Logger:        l.With(slogutil.KeyPrefix, "ratelimit"),
+		Ratelimit:     conf.Ratelimit,
+		SubnetLenIPv4: conf.RatelimitSubnetLenIPv4,
+		SubnetLenIPv6: conf.RatelimitSubnetLenIPv6,
+	}
+	if err = rlConf.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+
+	return ratelimit.NewMiddleware(rlConf), nil
 }
 
 // defaultLocalTimeout is the default timeout for local operations.

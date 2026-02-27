@@ -107,19 +107,27 @@ type configuration struct {
 	// greater.
 	CacheMaxTTL uint32 `yaml:"cache-max-ttl"`
 
+	// OptimisticAnswerTTL is the default TTL for expired cached responses
+	// in seconds.
+	OptimisticAnswerTTL timeutil.Duration `yaml:"optimistic-answer-ttl"`
+
+	// OptimisticMaxAge is the maximum time entries remain in the cache
+	// when cache is optimistic.
+	OptimisticMaxAge timeutil.Duration `yaml:"optimistic-max-age"`
+
 	// CacheSizeBytes is the cache size in bytes.  Default is 64k.
 	CacheSizeBytes int `yaml:"cache-size"`
 
 	// Ratelimit is the maximum number of requests per second.
-	Ratelimit int `yaml:"ratelimit"`
+	Ratelimit uint `yaml:"ratelimit"`
 
 	// RatelimitSubnetLenIPv4 is a subnet length for IPv4 addresses used for
 	// rate limiting requests.
-	RatelimitSubnetLenIPv4 int `yaml:"ratelimit-subnet-len-ipv4"`
+	RatelimitSubnetLenIPv4 uint `yaml:"ratelimit-subnet-len-ipv4"`
 
 	// RatelimitSubnetLenIPv6 is a subnet length for IPv6 addresses used for
 	// rate limiting requests.
-	RatelimitSubnetLenIPv6 int `yaml:"ratelimit-subnet-len-ipv6"`
+	RatelimitSubnetLenIPv6 uint `yaml:"ratelimit-subnet-len-ipv6"`
 
 	// UDPBufferSize is the size of the UDP buffer in bytes.  A value <= 0 will
 	// use the system default.
@@ -202,6 +210,8 @@ func parseConfig() (conf *configuration, exitCode int, err error) {
 		UpstreamMode:           string(proxy.UpstreamModeLoadBalance),
 		CacheSizeBytes:         64 * 1024,
 		Timeout:                timeutil.Duration(10 * time.Second),
+		OptimisticAnswerTTL:    timeutil.Duration(proxy.DefaultOptimisticAnswerTTL),
+		OptimisticMaxAge:       timeutil.Duration(proxy.DefaultOptimisticMaxAge),
 		RatelimitSubnetLenIPv4: 24,
 		RatelimitSubnetLenIPv6: 56,
 		HostsFileEnabled:       true,
