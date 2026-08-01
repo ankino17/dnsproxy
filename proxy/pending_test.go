@@ -1,6 +1,7 @@
 package proxy_test
 
 import (
+	"context"
 	"net"
 	"net/netip"
 	"sync"
@@ -79,10 +80,10 @@ func TestPendingRequests(t *testing.T) {
 	workloadWG.Add(reqsNum)
 
 	reqHandler := &proxy.TestHandler{
-		OnHandle: func(p *proxy.Proxy, d *proxy.DNSContext) (err error) {
+		OnHandle: func(ctx context.Context, p *proxy.Proxy, d *proxy.DNSContext) (err error) {
 			workloadWG.Done()
 
-			return p.Resolve(d)
+			return p.Resolve(ctx, d)
 		},
 	}
 
@@ -116,6 +117,7 @@ func TestPendingRequests(t *testing.T) {
 		TCPListenAddr:          []*net.TCPAddr{net.TCPAddrFromAddrPort(localhostAnyPort)},
 		CacheSizeBytes:         testCacheSize,
 		CacheEnabled:           true,
+		DNSSECEnabled:          true,
 		EnableEDNSClientSubnet: true,
 	})
 	require.NoError(t, err)

@@ -84,7 +84,7 @@ func TestProxy_quic(t *testing.T) {
 
 func TestProxy_quicLargePackets(t *testing.T) {
 	reqHandler := &TestHandler{
-		OnHandle: func(_ *Proxy, d *DNSContext) (err error) {
+		OnHandle: func(_ context.Context, _ *Proxy, d *DNSContext) (err error) {
 			d.Res = newTestResponse(d)
 
 			return nil
@@ -93,14 +93,13 @@ func TestProxy_quicLargePackets(t *testing.T) {
 
 	serverConfig, caPem := newTLSConfig(t)
 	dnsProxy := mustNew(t, &Config{
-		Logger:          testLogger,
-		UpstreamConfig:  newTestUpstreamConfig(t, defaultTimeout, testDefaultUpstreamAddr),
-		TrustedProxies:  defaultTrustedProxies,
-		RequestHandler:  reqHandler,
-		TLSConfig:       serverConfig,
-		TLSListenAddr:   []*net.TCPAddr{net.TCPAddrFromAddrPort(localhostAnyPort)},
-		HTTPSListenAddr: []*net.TCPAddr{net.TCPAddrFromAddrPort(localhostAnyPort)},
-		QUICListenAddr:  []*net.UDPAddr{net.UDPAddrFromAddrPort(localhostAnyPort)},
+		Logger:         testLogger,
+		UpstreamConfig: newTestUpstreamConfig(t, defaultTimeout, testDefaultUpstreamAddr),
+		TrustedProxies: defaultTrustedProxies,
+		RequestHandler: reqHandler,
+		TLSConfig:      serverConfig,
+		TLSListenAddr:  []*net.TCPAddr{net.TCPAddrFromAddrPort(localhostAnyPort)},
+		QUICListenAddr: []*net.UDPAddr{net.UDPAddrFromAddrPort(localhostAnyPort)},
 	})
 
 	servicetest.RequireRun(t, dnsProxy, testTimeout)
@@ -148,8 +147,8 @@ func TestProxy_quicTruncatedRequest(t *testing.T) {
 		UpstreamConfig: newTestUpstreamConfig(t, defaultTimeout, testDefaultUpstreamAddr),
 		TrustedProxies: defaultTrustedProxies,
 		RequestHandler: &TestHandler{
-			OnHandle: func(p *Proxy, d *DNSContext) (_ error) {
-				panic(testutil.UnexpectedCall(p, d))
+			OnHandle: func(ctx context.Context, p *Proxy, d *DNSContext) (_ error) {
+				panic(testutil.UnexpectedCall(ctx, p, d))
 			},
 		},
 	}
@@ -290,10 +289,7 @@ func writeQUICStream(buf []byte, stream *quic.Stream) (err error) {
 	chunkSize := 400
 	for i := 0; i < len(buf); i += chunkSize {
 		chunkStart := i
-		chunkEnd := i + chunkSize
-		if chunkEnd > len(buf) {
-			chunkEnd = len(buf)
-		}
+		chunkEnd := min(i+chunkSize, len(buf))
 
 		_, err = stream.Write(buf[chunkStart:chunkEnd])
 		if err != nil {

@@ -46,20 +46,25 @@ type configuration struct {
 	// ListenAddrs is the list of server's listen addresses.
 	ListenAddrs []string `yaml:"listen-addrs"`
 
-	// ListenPorts are the ports server listens on.
-	ListenPorts []int `yaml:"listen-ports"`
+	// DoHRoutes is the list of routes for DNS-over-HTTPS.  It must be a slice
+	// of valid route patterns, if it is empty, the default routes are
+	// registered.
+	DoHRoutes []string `yaml:"doh-routes"`
+
+	// ListenPorts are the ports server listens on for plain DNS.
+	ListenPorts []uint16 `yaml:"listen-ports"`
 
 	// HTTPSListenPorts are the ports server listens on for DNS-over-HTTPS.
-	HTTPSListenPorts []int `yaml:"https-port"`
+	HTTPSListenPorts []uint16 `yaml:"https-port"`
 
 	// TLSListenPorts are the ports server listens on for DNS-over-TLS.
-	TLSListenPorts []int `yaml:"tls-port"`
+	TLSListenPorts []uint16 `yaml:"tls-port"`
 
 	// QUICListenPorts are the ports server listens on for DNS-over-QUIC.
-	QUICListenPorts []int `yaml:"quic-port"`
+	QUICListenPorts []uint16 `yaml:"quic-port"`
 
 	// DNSCryptListenPorts are the ports server listens on for DNSCrypt.
-	DNSCryptListenPorts []int `yaml:"dnscrypt-port"`
+	DNSCryptListenPorts []uint16 `yaml:"dnscrypt-port"`
 
 	// Upstreams is the list of DNS upstream servers.
 	Upstreams []string `yaml:"upstream"`
@@ -146,6 +151,10 @@ type configuration struct {
 	// TODO(d.kolyshev): Use more suitable type.
 	TLSMaxVersion float32 `yaml:"tls-max-version"`
 
+	// DoHInsecureEnabled controls whether the DoH server should skip TLS
+	// certificate verification.
+	DoHInsecureEnabled bool `yaml:"doh-insecure-enabled"`
+
 	// help, if true, prints the command-line option help message and quit with
 	// a successful exit-code.
 	help bool
@@ -185,6 +194,10 @@ type configuration struct {
 	// RefuseAny makes the server to refuse requests of type ANY.
 	RefuseAny bool `yaml:"refuse-any"`
 
+	// DNSSECEnabled defines whether the proxy should set the DO bits in the
+	// upstream requests.
+	DNSSECEnabled bool `yaml:"dnssec"`
+
 	// EnableEDNSSubnet uses EDNS Client Subnet extension.
 	EnableEDNSSubnet bool `yaml:"edns"`
 
@@ -214,6 +227,7 @@ func parseConfig() (conf *configuration, exitCode int, err error) {
 		OptimisticMaxAge:       timeutil.Duration(proxy.DefaultOptimisticMaxAge),
 		RatelimitSubnetLenIPv4: 24,
 		RatelimitSubnetLenIPv6: 56,
+		DNSSECEnabled:          true,
 		HostsFileEnabled:       true,
 		PendingRequestsEnabled: true,
 	}
