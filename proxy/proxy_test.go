@@ -1,16 +1,21 @@
 package proxy_test
 
 import (
+	"context"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/AdguardTeam/dnsproxy/dnsproxytest"
 	"github.com/AdguardTeam/dnsproxy/internal/bootstrap"
-	"github.com/AdguardTeam/dnsproxy/internal/dnsproxytest"
+	proxytest "github.com/AdguardTeam/dnsproxy/internal/dnsproxytest"
 	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/dnsproxy/upstream"
+	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/AdguardTeam/golibs/testutil/servicetest"
@@ -34,6 +39,120 @@ var (
 	// testIPv4 is a common IPv4 for tests
 	testIPv4 = net.IP{192, 0, 2, 0}
 )
+
+// TODO(f.setrakov): DRY upstream helpers with their internal versions.
+
+// newTestUpstream returns default upstream mock, which responds with single A
+// record with [proxytest.IPv4] value to all requests.  Other upstream
+// methods will be replaced with stub implementations.
+func newTestUpstream(tb testing.TB) (uc upstream.Upstream) {
+	tb.Helper()
+
+	onExchange := func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
+		return proxytest.NewTestResponse(req), nil
+	}
+
+	return newTestUpstreamWithExchange(tb, onExchange)
+}
+
+// newTestUpstreamWithExchange returns upstream mock which uses given callback
+// for [upstream.Upstream.Exchange] implementation.  Other upstream methods will
+// be replaced with stub implementations.
+func newTestUpstreamWithExchange(
+	tb testing.TB,
+	onExchange func(ctx context.Context, req *dns.Msg) (resp *dns.Msg, err error),
+) (uc upstream.Upstream) {
+	tb.Helper()
+
+	return &dnsproxytest.Upstream{
+		OnAddress:  func() (addr string) { return "" },
+		OnExchange: onExchange,
+		OnClose:    func() (err error) { return nil },
+	}
+}
+
+// mustStartDefaultProxy starts a new proxy with default settings and returns
+// it.  It fails the test on error.
+func mustStartDefaultProxy(tb testing.TB) (p *proxy.Proxy) {
+	tb.Helper()
+
+	p, err := proxy.New(&proxy.Config{
+		Logger:        testLogger,
+		UDPListenAddr: []*net.UDPAddr{net.UDPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
+		TCPListenAddr: []*net.TCPAddr{net.TCPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
+		UpstreamConfig: &proxy.UpstreamConfig{
+			Upstreams: []upstream.Upstream{newTestUpstream(tb)},
+		},
+		TrustedProxies: proxytest.DefaultTrustedProxies,
+	})
+	require.NoError(tb, err)
+
+	servicetest.RequireRun(tb, p, proxytest.Timeout)
+
+	return p
+}
+
+// sendTestMessages sends [proxytest.MessageCount] DNS requests to the specified
+// connection and checks the responses.
+func sendTestMessages(tb testing.TB, conn *dns.Conn) {
+	tb.Helper()
+
+	for i := range proxytest.MessageCount {
+		req := proxytest.NewTestRequest()
+		err := conn.WriteMsg(req)
+		require.NoErrorf(tb, err, "req number %d", i)
+
+		res, err := conn.ReadMsg()
+		require.NoErrorf(tb, err, "resp number %d", i)
+
+		proxytest.RequireResponse(tb, req, res)
+	}
+}
+
+func TestProxy_Resolve_badResponse(t *testing.T) {
+	dnsProxy := mustStartDefaultProxy(t)
+
+	onExchange := func(_ context.Context, m *dns.Msg) (resp *dns.Msg, err error) {
+		resp = (&dns.Msg{}).SetReply(m)
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{
+				Name:   m.Question[0].Name,
+				Class:  dns.ClassINET,
+				Rrtype: dns.TypeA,
+			},
+			A: net.IP{1, 2, 3, 4},
+		})
+		// Make the response invalid.
+		resp.Question = []dns.Question{}
+
+		return resp, nil
+	}
+
+	u := &dnsproxytest.Upstream{
+		OnExchange: onExchange,
+		OnAddress:  func() (addr string) { return "stub" },
+		OnClose:    func() (_ error) { panic(testutil.UnexpectedCall()) },
+	}
+
+	d := &proxy.DNSContext{
+		CustomUpstreamConfig: proxy.NewCustomUpstreamConfig(
+			&proxy.UpstreamConfig{Upstreams: []upstream.Upstream{u}},
+			false,
+			0,
+			false,
+		),
+		Req:  proxytest.NewTestRequestWithHost("host"),
+		Addr: netip.MustParseAddrPort("1.2.3.0:1234"),
+	}
+
+	var err error
+	require.NotPanics(t, func() {
+		err = dnsProxy.Resolve(testutil.ContextWithTimeout(t, defaultTimeout), d)
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, d.Req.Question[0], d.Res.Question[0])
+}
 
 // newCustomUpstreamConfig is a helper function that returns an initialized
 // [*proxy.CustomUpstreamConfig].
@@ -74,6 +193,74 @@ func isCachedWithCustomConfig(
 	return s[0].IsCached
 }
 
+func TestProxy_HandleDNSRequest_race(t *testing.T) {
+	upsConf := &proxy.UpstreamConfig{
+		Upstreams: []upstream.Upstream{newTestUpstream(t)},
+	}
+
+	dnsProxy, err := proxy.New(&proxy.Config{
+		Logger:         testLogger,
+		UDPListenAddr:  []*net.UDPAddr{net.UDPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
+		TCPListenAddr:  []*net.TCPAddr{net.TCPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
+		UpstreamConfig: upsConf,
+		TrustedProxies: proxytest.DefaultTrustedProxies,
+	})
+	require.NoError(t, err)
+
+	servicetest.RequireRun(t, dnsProxy, proxytest.Timeout)
+
+	addr := dnsProxy.Addr(proxy.ProtoUDP)
+	conn, err := dns.Dial("udp", addr.String())
+	require.NoError(t, err)
+
+	wg := &sync.WaitGroup{}
+
+	pt := testutil.NewPanicT(t)
+	for range proxytest.MessageCount {
+		wg.Go(func() {
+			req := proxytest.NewTestRequest()
+			writeErr := conn.WriteMsg(req)
+			require.NoError(pt, writeErr)
+
+			res, readErr := conn.ReadMsg()
+			require.NoError(pt, readErr)
+
+			// We do not check if msg IDs match because the order of responses
+			// may be different.
+
+			require.NotNil(pt, res)
+			require.Len(pt, res.Answer, 1)
+
+			a := testutil.RequireTypeAssert[*dns.A](pt, res.Answer[0])
+			require.IsType(pt, &dns.A{}, res.Answer[0])
+
+			require.Equal(pt, proxytest.IPv4.To16(), a.A.To16())
+		})
+	}
+
+	wg.Wait()
+}
+
+func TestProxy_HandleDNSRequest_responseInRequest(t *testing.T) {
+	dnsProxy := mustStartDefaultProxy(t)
+
+	addr := dnsProxy.Addr(proxy.ProtoTCP)
+	client := &dns.Client{
+		Net:     string(proxy.ProtoTCP),
+		Timeout: proxytest.Timeout,
+	}
+
+	req := proxytest.NewTestRequest()
+	req.Response = true
+
+	r, _, err := client.Exchange(req, addr.String())
+
+	netErr := &net.OpError{}
+	require.ErrorAs(t, err, &netErr)
+	assert.True(t, netErr.Timeout())
+	assert.Nil(t, r)
+}
+
 func TestProxy_Resolve_cache(t *testing.T) {
 	const host = "example.test."
 
@@ -81,7 +268,7 @@ func TestProxy_Resolve_cache(t *testing.T) {
 		OnAddress: func() (addr string) { return "stub" },
 		OnClose:   func() (err error) { return nil },
 	}
-	ups.OnExchange = func(req *dns.Msg) (resp *dns.Msg, err error) {
+	ups.OnExchange = func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
 		resp = (&dns.Msg{}).SetReply(req)
 		resp.Answer = append(resp.Answer, &dns.A{
 			Hdr: dns.RR_Header{
@@ -142,14 +329,14 @@ func TestProxy_Resolve_cache(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			p, err := proxy.New(&proxy.Config{
 				Logger:         testLogger,
-				UDPListenAddr:  []*net.UDPAddr{net.UDPAddrFromAddrPort(localhostAnyPort)},
+				UDPListenAddr:  []*net.UDPAddr{net.UDPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
 				UpstreamConfig: upsConf,
 				CacheEnabled:   tc.prxCacheEnabled,
 			})
 			require.NoError(t, err)
 			require.NotNil(t, p)
 
-			servicetest.RequireRun(t, p, testTimeout)
+			servicetest.RequireRun(t, p, proxytest.Timeout)
 
 			res := isCachedWithCustomConfig(t, p, tc.customUpstreamConf, host)
 			assert.False(t, res)
@@ -166,21 +353,24 @@ func TestProxy_Resolve_cache(t *testing.T) {
 func TestProxy_Start_closeOnFail(t *testing.T) {
 	t.Parallel()
 
-	l, err := net.ListenTCP(bootstrap.NetworkTCP, net.TCPAddrFromAddrPort(localhostAnyPort))
+	addr := net.TCPAddrFromAddrPort(proxytest.LocalhostAnyPort)
+	l, err := net.ListenTCP(bootstrap.NetworkTCP, addr)
 	require.NoError(t, err)
 
 	tcpAddr := testutil.RequireTypeAssert[*net.TCPAddr](t, l.Addr())
 
 	ups := &dnsproxytest.Upstream{
-		OnExchange: func(m *dns.Msg) (_ *dns.Msg, _ error) { panic(testutil.UnexpectedCall(m)) },
-		OnAddress:  func() (_ string) { panic(testutil.UnexpectedCall()) },
-		OnClose:    func() (_ error) { panic(testutil.UnexpectedCall()) },
+		OnExchange: func(ctx context.Context, m *dns.Msg) (_ *dns.Msg, _ error) {
+			panic(testutil.UnexpectedCall(ctx, m))
+		},
+		OnAddress: func() (_ string) { panic(testutil.UnexpectedCall()) },
+		OnClose:   func() (_ error) { panic(testutil.UnexpectedCall()) },
 	}
 
 	p, err := proxy.New(&proxy.Config{
 		Logger: testLogger,
 		// Add a free address.
-		UDPListenAddr: []*net.UDPAddr{net.UDPAddrFromAddrPort(localhostAnyPort)},
+		UDPListenAddr: []*net.UDPAddr{net.UDPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
 		// Add a bound address.
 		TCPListenAddr:  []*net.TCPAddr{tcpAddr},
 		UpstreamConfig: &proxy.UpstreamConfig{Upstreams: []upstream.Upstream{ups}},
@@ -188,7 +378,7 @@ func TestProxy_Start_closeOnFail(t *testing.T) {
 	require.NoError(t, err)
 
 	require.True(t, t.Run("start_fail", func(t *testing.T) {
-		ctx := testutil.ContextWithTimeout(t, testTimeout)
+		ctx := testutil.ContextWithTimeout(t, proxytest.Timeout)
 		err = p.Start(ctx)
 
 		var netErr net.Error
@@ -201,7 +391,7 @@ func TestProxy_Start_closeOnFail(t *testing.T) {
 	require.True(t, t.Run("restart_success", func(t *testing.T) {
 		require.NoError(t, l.Close())
 
-		servicetest.RequireRun(t, p, testTimeout)
+		servicetest.RequireRun(t, p, proxytest.Timeout)
 	}))
 }
 
@@ -212,7 +402,7 @@ func TestProxy_ServeDNS_formatError(t *testing.T) {
 		OnAddress: func() (addr string) { return testIPv4.String() },
 		OnClose:   func() (err error) { return nil },
 	}
-	ups.OnExchange = func(req *dns.Msg) (resp *dns.Msg, err error) {
+	ups.OnExchange = func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
 		panic(testutil.UnexpectedCall(req))
 	}
 
@@ -230,17 +420,19 @@ func TestProxy_ServeDNS_formatError(t *testing.T) {
 	testDataPattern := filepath.Join("testdata", t.Name(), "*")
 	testNames, err := filepath.Glob(testDataPattern)
 	require.NoError(t, err)
+	require.NotEmpty(t, testNames)
 
 	p, err := proxy.New(&proxy.Config{
-		UDPListenAddr:  []*net.UDPAddr{net.UDPAddrFromAddrPort(localhostAnyPort)},
+		UDPListenAddr:  []*net.UDPAddr{net.UDPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
 		UpstreamConfig: upsConf,
 		Logger:         testLogger,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, p)
-	servicetest.RequireRun(t, p, testTimeout)
+	servicetest.RequireRun(t, p, proxytest.Timeout)
 
-	addr := p.Addr(proxy.ProtoUDP).String()
+	addr := p.Addr(proxy.ProtoUDP)
+
 	for _, testName := range testNames {
 		t.Run(testName, func(t *testing.T) {
 			skipDarwin(t, exception)
@@ -254,11 +446,11 @@ func TestProxy_ServeDNS_formatError(t *testing.T) {
 
 // testJiggleVulnerability makes sure that proxy correctly responds to malformed
 // DNS packets without crashing.
-func testJiggleVulnerability(tb testing.TB, dataPath, addr string) {
+func testJiggleVulnerability(tb testing.TB, dataPath string, addr net.Addr) {
 	data, err := os.ReadFile(dataPath)
 	require.NoError(tb, err)
 
-	conn := requireDial(tb, addr)
+	conn := requireDial(tb, addr, proxytest.Timeout)
 	requireWritePacket(tb, conn, data)
 	resp := requireReadPacket(tb, conn)
 
@@ -269,16 +461,16 @@ func testJiggleVulnerability(tb testing.TB, dataPath, addr string) {
 	assert.Equal(tb, msg.Rcode, dns.RcodeFormatError)
 }
 
-// requireDial dials the given address and returns the connection.  The
-// connection is closed in the test cleanup.
-func requireDial(tb testing.TB, addr string) (conn net.Conn) {
+// requireDial dials the given address and returns the connection, setting a
+// deadline to reflect timeout.  The connection is closed in the test cleanup.
+func requireDial(tb testing.TB, addr net.Addr, timeout time.Duration) (conn net.Conn) {
 	tb.Helper()
 
-	conn, err := net.DialTimeout(string(proxy.ProtoUDP), addr, testTimeout)
+	conn, err := net.DialTimeout(addr.Network(), addr.String(), timeout)
 	require.NoError(tb, err)
 	testutil.CleanupAndRequireSuccess(tb, conn.Close)
 
-	deadline := time.Now().Add(testTimeout)
+	deadline := time.Now().Add(timeout)
 	require.NoError(tb, conn.SetDeadline(deadline))
 
 	return conn
@@ -304,4 +496,252 @@ func requireReadPacket(tb testing.TB, conn net.Conn) (data []byte) {
 	require.Positive(tb, n)
 
 	return buf[:n]
+}
+
+func TestProxy_HandleDNSRequest_exchangeWithReservedDomains(t *testing.T) {
+	t.Parallel()
+
+	emptyUpstream := newTestUpstreamWithExchange(
+		t,
+		func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
+			return (&dns.Msg{}).SetReply(req), nil
+		},
+	)
+
+	const (
+		host1 = "test-1.example"
+		host2 = "subdomain." + host1
+
+		fqdn1 = host1 + "."
+		fqdn2 = host2 + "."
+	)
+
+	upsConf := &proxy.UpstreamConfig{
+		DomainReservedUpstreams: map[string][]upstream.Upstream{
+			fqdn1: {emptyUpstream},
+			fqdn2: {},
+		},
+		SpecifiedDomainUpstreams: map[string][]upstream.Upstream{
+			fqdn1: {emptyUpstream},
+			fqdn2: {},
+		},
+		SubdomainExclusions: container.NewMapSet[string](),
+		Upstreams:           []upstream.Upstream{newTestUpstream(t)},
+	}
+	dnsProxy, err := proxy.New(&proxy.Config{
+		Logger:         testLogger,
+		UDPListenAddr:  []*net.UDPAddr{net.UDPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
+		TCPListenAddr:  []*net.TCPAddr{net.TCPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
+		UpstreamConfig: upsConf,
+		TrustedProxies: proxytest.DefaultTrustedProxies,
+	})
+	require.NoError(t, err)
+
+	servicetest.RequireRun(t, dnsProxy, proxytest.Timeout)
+
+	addr := dnsProxy.Addr(proxy.ProtoTCP)
+	conn, err := dns.Dial("tcp", addr.String())
+	require.NoError(t, err)
+	testutil.CleanupAndRequireSuccess(t, conn.Close)
+
+	testCases := []struct {
+		name         string
+		host         string
+		wantResponse bool
+	}{{
+		name:         "common",
+		host:         proxytest.Host,
+		wantResponse: true,
+	}, {
+		name:         "empty_upstream_response",
+		host:         host1,
+		wantResponse: false,
+	}, {
+		name:         "non_empty_response_for_subdomain",
+		host:         host2,
+		wantResponse: true,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := proxytest.NewTestRequestWithHost(tc.host)
+			err = conn.WriteMsg(req)
+			require.NoError(t, err)
+
+			var res *dns.Msg
+			res, err = conn.ReadMsg()
+			require.NoError(t, err)
+
+			if tc.wantResponse {
+				proxytest.RequireResponse(t, req, res)
+			} else {
+				require.NotNil(t, res)
+				require.Empty(t, res.Answer)
+			}
+		})
+	}
+}
+
+func TestProxy_HandleDNSRequest_oneByOneUpstreamsExchange(t *testing.T) {
+	t.Parallel()
+
+	errUpstream := newTestUpstreamWithExchange(
+		t,
+		func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
+			return nil, assert.AnError
+		},
+	)
+
+	dnsProxy, err := proxy.New(&proxy.Config{
+		Logger:        testLogger,
+		UDPListenAddr: []*net.UDPAddr{net.UDPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
+		TCPListenAddr: []*net.TCPAddr{net.TCPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
+		UpstreamConfig: &proxy.UpstreamConfig{
+			Upstreams: []upstream.Upstream{errUpstream, errUpstream, newTestUpstream(t)},
+		},
+		TrustedProxies: proxytest.DefaultTrustedProxies,
+		Fallbacks: &proxy.UpstreamConfig{
+			Upstreams: []upstream.Upstream{errUpstream},
+		},
+	})
+	require.NoError(t, err)
+	servicetest.RequireRun(t, dnsProxy, proxytest.Timeout)
+
+	addr := dnsProxy.Addr(proxy.ProtoTCP)
+	conn, err := dns.Dial("tcp", addr.String())
+	require.NoError(t, err)
+	testutil.CleanupAndRequireSuccess(t, conn.Close)
+
+	req := proxytest.NewTestRequest()
+	err = conn.WriteMsg(req)
+	require.NoError(t, err)
+
+	res, err := conn.ReadMsg()
+	require.NoError(t, err)
+	proxytest.RequireResponse(t, req, res)
+}
+
+func TestProxy_HandleDNSRequest_fallback(t *testing.T) {
+	t.Parallel()
+
+	const (
+		hostSuccess         = "specific.example"
+		hostFail            = "failing.example"
+		hostFallbackSuccess = "fallback.success.example"
+
+		fqdnSuccess         = hostSuccess + "."
+		fqdnFail            = hostFail + "."
+		fqdnFallbackSuccess = hostFallbackSuccess + "."
+	)
+
+	responseCh := make(chan uint16)
+	failCh := make(chan uint16)
+
+	pt := testutil.NewPanicT(t)
+
+	successExchange := func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
+		testutil.RequireSend(pt, responseCh, req.Id, proxytest.Timeout)
+
+		return proxytest.NewTestResponse(req), nil
+	}
+	successUpstream := newTestUpstreamWithExchange(t, successExchange)
+
+	failUpstream := newTestUpstreamWithExchange(
+		t,
+		func(_ context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
+			testutil.RequireSend(pt, failCh, req.Id, proxytest.Timeout)
+
+			return nil, assert.AnError
+		},
+	)
+
+	upsConf := &proxy.UpstreamConfig{
+		DomainReservedUpstreams: map[string][]upstream.Upstream{
+			fqdnSuccess: {successUpstream},
+			fqdnFail:    {failUpstream},
+		},
+		SpecifiedDomainUpstreams: map[string][]upstream.Upstream{
+			fqdnSuccess: {successUpstream},
+			fqdnFail:    {failUpstream},
+		},
+
+		SubdomainExclusions: container.NewMapSet[string](),
+		Upstreams:           []upstream.Upstream{failUpstream},
+	}
+
+	fallbackConf := &proxy.UpstreamConfig{
+		DomainReservedUpstreams: map[string][]upstream.Upstream{
+			fqdnFail:            {failUpstream},
+			fqdnFallbackSuccess: {successUpstream},
+		},
+		SpecifiedDomainUpstreams: map[string][]upstream.Upstream{
+			fqdnFail:            {failUpstream},
+			fqdnFallbackSuccess: {successUpstream},
+		},
+
+		SubdomainExclusions: container.NewMapSet[string](),
+		Upstreams:           []upstream.Upstream{failUpstream, successUpstream},
+	}
+
+	dnsProxy, err := proxy.New(&proxy.Config{
+		Logger:         testLogger,
+		UDPListenAddr:  []*net.UDPAddr{net.UDPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
+		TCPListenAddr:  []*net.TCPAddr{net.TCPAddrFromAddrPort(proxytest.LocalhostAnyPort)},
+		UpstreamConfig: upsConf,
+		TrustedProxies: proxytest.DefaultTrustedProxies,
+		Fallbacks:      fallbackConf,
+	})
+	require.NoError(t, err)
+	servicetest.RequireRun(t, dnsProxy, proxytest.Timeout)
+
+	conn, err := dns.Dial("tcp", dnsProxy.Addr(proxy.ProtoTCP).String())
+	require.NoError(t, err)
+	testutil.CleanupAndRequireSuccess(t, conn.Close)
+
+	testCases := []struct {
+		name        string
+		wantSignals []chan uint16
+	}{{
+		name: proxytest.Host,
+		wantSignals: []chan uint16{
+			failCh,
+			failCh,
+			responseCh,
+		},
+	}, {
+		name: hostSuccess,
+		wantSignals: []chan uint16{
+			responseCh,
+		},
+	}, {
+		name: hostFail,
+		wantSignals: []chan uint16{
+			failCh,
+			failCh,
+		},
+	}, {
+		name: hostFallbackSuccess,
+		wantSignals: []chan uint16{
+			failCh,
+			responseCh,
+		},
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := proxytest.NewTestRequestWithHost(tc.name)
+			err = conn.WriteMsg(req)
+			require.NoError(t, err)
+
+			for _, ch := range tc.wantSignals {
+				reqID, ok := testutil.RequireReceive(testutil.NewPanicT(t), ch, proxytest.Timeout)
+				require.True(t, ok)
+
+				assert.Equal(t, req.Id, reqID)
+			}
+
+			_, err = conn.ReadMsg()
+			require.NoError(t, err)
+		})
+	}
 }

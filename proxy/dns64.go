@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
@@ -39,24 +41,24 @@ const (
 // synthesize AAAA records.
 //
 // TODO(e.burkov):  Split validation and initialization.
-func (p *Proxy) setupDNS64() (err error) {
-	if !p.Config.UseDNS64 {
+func (p *Proxy) setupDNS64(dns64Prefs netutil.SliceSubnetSet) (err error) {
+	if !p.useDNS64 {
 		return nil
 	}
 
-	if len(p.Config.DNS64Prefs) == 0 {
+	if len(dns64Prefs) == 0 {
 		p.dns64Prefs = netutil.SliceSubnetSet{dns64WellKnownPref}
 
 		return nil
 	}
 
-	for i, pref := range p.Config.DNS64Prefs {
+	for i, pref := range dns64Prefs {
 		if !pref.Addr().Is6() {
-			return fmt.Errorf("prefix at index %d: %q is not an IPv6 prefix", i, pref)
+			return fmt.Errorf("prefix at index %d: %q is not an ipv6 prefix", i, pref)
 		}
 
 		if pref.Bits() > maxNAT64PrefixBitLen {
-			return fmt.Errorf("prefix at index %d: %q is too long for DNS64", i, pref)
+			return fmt.Errorf("prefix at index %d: %q is too long for dns64", i, pref)
 		}
 
 		p.dns64Prefs = append(p.dns64Prefs, pref.Masked())
@@ -112,38 +114,31 @@ func (p *Proxy) checkDNS64(req, resp *dns.Msg) (dns64Req *dns.Msg) {
 
 // filterNAT64Answers filters out AAAA records that are within one of NAT64
 // exclusion prefixes.  hasAnswers is true if the filtered slice contains at
-// least a single AAAA answer not within the prefixes or a CNAME.
-//
-// TODO(e.burkov):  Remove prefs from args when old API is removed.
+// least a single AAAA answer not within the prefixes.
 func (p *Proxy) filterNAT64Answers(rrs []dns.RR) (filtered []dns.RR, hasAnswers bool) {
-	filtered = make([]dns.RR, 0, len(rrs))
-	for _, ans := range rrs {
-		switch ans := ans.(type) {
-		case *dns.AAAA:
-			addr, err := netutil.IPToAddrNoMapped(ans.AAAA)
-			if err != nil {
-				p.logger.Error("bad aaaa record", slogutil.KeyError, err)
-			} else if p.dns64Prefs.Contains(addr) {
-				// Filter the record.
-				continue
-			} else {
-				filtered, hasAnswers = append(filtered, ans), true
-			}
-		case *dns.CNAME, *dns.DNAME:
-			// If the response contains a CNAME or a DNAME, then the CNAME or
-			// DNAME chain is followed until the first terminating A or AAAA
-			// record is reached.
-			//
-			// Just treat CNAME and DNAME responses as passable answers since
-			// AdGuard Home doesn't follow any of these chains except the
-			// dnsrewrite-defined ones.
-			filtered, hasAnswers = append(filtered, ans), true
-		default:
-			filtered = append(filtered, ans)
+	return slices.DeleteFunc(rrs, func(rr dns.RR) (ok bool) {
+		ans, ok := rr.(*dns.AAAA)
+		if !ok {
+			return false
 		}
-	}
 
-	return filtered, hasAnswers
+		addr, err := netutil.IPToAddrNoMapped(ans.AAAA)
+		if err != nil {
+			// TODO(e.burkov):  Use [slog.Logger.ErrorContext] when this
+			// function accepts a context.
+			p.logger.Error("bad aaaa record", slogutil.KeyError, err)
+
+			return true
+		}
+
+		if p.dns64Prefs.Contains(addr) {
+			return true
+		}
+
+		hasAnswers = true
+
+		return false
+	}), hasAnswers
 }
 
 // synthDNS64 synthesizes a DNS64 response using the original response as a
@@ -280,37 +275,41 @@ func (p *Proxy) synthRR(rr dns.RR, soaTTL uint32) (result dns.RR) {
 	return aaaa
 }
 
-// performDNS64 returns the upstream that was used to perform DNS64 request, or
-// nil, if the request was not performed.
+// performDNS64 receives unwrapped upstreams, wraps them itself and returns
+// both the resolver and the wrapped upstreams, or nil, nil, if DNS64 was not
+// applied.  If origResp is not nil, origReq must also not be nil.
 func (p *Proxy) performDNS64(
+	ctx context.Context,
 	origReq *dns.Msg,
 	origResp *dns.Msg,
 	upstreams []upstream.Upstream,
-) (u upstream.Upstream) {
+) (u upstream.Upstream, wrapped []upstream.Upstream) {
 	if origResp == nil {
-		return nil
+		return nil, nil
 	}
 
 	dns64Req := p.checkDNS64(origReq, origResp)
 	if dns64Req == nil {
-		return nil
+		return nil, nil
 	}
 
 	host := origReq.Question[0].Name
-	p.logger.Debug("received an empty aaaa response, checking dns64", "host", host)
+	p.logger.DebugContext(ctx, "received an empty aaaa response, checking dns64", "host", host)
 
-	dns64Resp, u, err := p.exchangeUpstreams(dns64Req, upstreams)
+	wrapped = upstreamsWithStats(upstreams)
+
+	dns64Resp, u, err := p.exchangeUpstreams(ctx, dns64Req, wrapped)
 	if err != nil {
-		p.logger.Error("dns64 request failed", slogutil.KeyError, err)
+		p.logger.ErrorContext(ctx, "dns64 request failed", slogutil.KeyError, err)
 
-		return nil
+		return nil, nil
 	}
 
 	if dns64Resp != nil && p.synthDNS64(origReq, origResp, dns64Resp) {
-		p.logger.Debug("synthesized aaaa response", "host", host)
+		p.logger.DebugContext(ctx, "synthesized aaaa response", "host", host)
 
-		return u
+		return u, wrapped
 	}
 
-	return nil
+	return nil, nil
 }

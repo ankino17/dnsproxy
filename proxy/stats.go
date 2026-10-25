@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -25,9 +26,9 @@ type upstreamWithStats struct {
 var _ upstream.Upstream = (*upstreamWithStats)(nil)
 
 // Exchange implements the [upstream.Upstream] for *upstreamWithStats.
-func (u *upstreamWithStats) Exchange(req *dns.Msg) (resp *dns.Msg, err error) {
+func (u *upstreamWithStats) Exchange(ctx context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
 	start := time.Now()
-	resp, err = u.upstream.Exchange(req)
+	resp, err = u.upstream.Exchange(ctx, req)
 	u.err = err
 	u.queryDuration = time.Since(start)
 
@@ -46,6 +47,7 @@ func (u *upstreamWithStats) Close() (err error) {
 
 // upstreamsWithStats takes a list of upstreams, wraps each upstream with
 // [upstreamWithStats] to gather statistics, and returns the wrapped upstreams.
+// All upstreams elements must not be nil.
 func upstreamsWithStats(upstreams []upstream.Upstream) (wrapped []upstream.Upstream) {
 	wrapped = make([]upstream.Upstream, 0, len(upstreams))
 	for _, u := range upstreams {
@@ -87,11 +89,20 @@ func (s *QueryStatistics) Fallback() (us []*UpstreamStatistics) {
 }
 
 // collectQueryStats gathers the statistics from the wrapped upstreams.
-// resolver is an upstream DNS resolver that successfully resolved the request,
-// if any.  Provided upstreams must be of type [*upstreamWithStats].  unwrapped
-// is the unwrapped resolver, see [upstreamWithStats.upstream].  The returned
-// statistics depend on whether the DNS request was successfully resolved and
-// the upstream mode, see [DNSContext.QueryStatistics].
+// resolver is the upstream that has successfully resolved the request, if
+// any.  unwrapped is nil if and only if resolver is nil.  Otherwise, it is
+// the upstream wrapped by resolver, see [upstreamWithStats.upstream].  Since
+// [*upstreamWithStats] is not safe for concurrent use, every upstream whose
+// statistics are read must have already finished its exchange.  The statistics
+// that are read depend on the resolver and the mode:
+//
+//   - If resolver is nil, the statistics of all the upstreams and fallbacks
+//     are read, so they must all have finished.
+//   - If resolver is non-nil and the mode is [UpstreamModeFastestAddr] or
+//     fallbacks is non-empty, the statistics of all the upstreams are read
+//     as well, so they must have finished too.
+//   - Otherwise, only the statistics of resolver are read, so only resolver
+//     must have finished.
 func collectQueryStats(
 	mode UpstreamMode,
 	resolver upstream.Upstream,
@@ -159,7 +170,7 @@ type UpstreamStatistics struct {
 }
 
 // collectUpstreamStats gathers the upstream statistics from the list of wrapped
-// upstreams.  upstreams must be of type *upstreamWithStats.
+// upstreams.  upstreams must be of type [*upstreamWithStats].
 func collectUpstreamStats(upstreams ...upstream.Upstream) (stats []*UpstreamStatistics) {
 	stats = make([]*UpstreamStatistics, 0, len(upstreams))
 

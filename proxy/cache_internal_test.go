@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"cmp"
+	"context"
 	"net"
 	"net/netip"
 	"strings"
@@ -20,18 +21,17 @@ import (
 	"github.com/miekg/dns"
 )
 
-// testCacheSize is the maximum size of cache for tests.
-const testCacheSize = 4096
-
 // testUpsAddr is the mock upstream address for tests.
 const testUpsAddr = "https://upstream.address"
 
 // upstreamWithAddr is a [dnsproxytest.Upstream] that is only expected to be
 // used to get its address.
-var upstreamWithAddr = &dnsproxytest.Upstream{
-	OnExchange: func(m *dns.Msg) (_ *dns.Msg, _ error) { panic(testutil.UnexpectedCall(m)) },
-	OnClose:    func() (_ error) { panic(testutil.UnexpectedCall()) },
-	OnAddress:  func() (addr string) { return testUpsAddr },
+var upstreamWithAddr = &testUpstream{
+	OnExchange: func(ctx context.Context, m *dns.Msg) (_ *dns.Msg, _ error) {
+		panic(testutil.UnexpectedCall(ctx, m))
+	},
+	OnClose:   func() (_ error) { panic(testutil.UnexpectedCall()) },
+	OnAddress: func() (addr string) { return testUpsAddr },
 }
 
 // newTestCache is a helper that returns new cache and fills its config with
@@ -42,7 +42,7 @@ func newTestCache(tb testing.TB, conf *cacheConfig) (c *cache) {
 	conf = cmp.Or(conf, &cacheConfig{})
 
 	return newCache(&cacheConfig{
-		size:             cmp.Or(conf.size, testCacheSize),
+		size:             cmp.Or(conf.size, dnsproxytest.CacheSize),
 		optimisticTTL:    cmp.Or(conf.optimisticTTL, testOptimisticTTL),
 		optimisticMaxAge: cmp.Or(conf.optimisticMaxAge, testOptimisticMaxAge),
 		withECS:          conf.withECS,
@@ -52,17 +52,19 @@ func newTestCache(tb testing.TB, conf *cacheConfig) (c *cache) {
 
 func TestServeCached(t *testing.T) {
 	dnsProxy := mustNew(t, &Config{
-		Logger:         testLogger,
-		UDPListenAddr:  []*net.UDPAddr{net.UDPAddrFromAddrPort(localhostAnyPort)},
-		TCPListenAddr:  []*net.TCPAddr{net.TCPAddrFromAddrPort(localhostAnyPort)},
-		UpstreamConfig: newTestUpstreamConfig(t, defaultTimeout, testDefaultUpstreamAddr),
-		TrustedProxies: defaultTrustedProxies,
+		Logger:        testLogger,
+		UDPListenAddr: []*net.UDPAddr{dnsproxytest.LocalhostAnyPortUDP},
+		TCPListenAddr: []*net.TCPAddr{dnsproxytest.LocalhostAnyPortTCP},
+		UpstreamConfig: &UpstreamConfig{
+			Upstreams: []upstream.Upstream{newTestUpstream(t)},
+		},
+		TrustedProxies: dnsproxytest.DefaultTrustedProxies,
 		DNSSECEnabled:  false,
 		CacheEnabled:   true,
 	})
 
 	// Start listening.
-	servicetest.RequireRun(t, dnsProxy, testTimeout)
+	servicetest.RequireRun(t, dnsProxy, dnsproxytest.Timeout)
 
 	// Create a DNS request.
 	request := (&dns.Msg{}).SetQuestion("google.com.", dns.TypeA)
@@ -70,21 +72,20 @@ func TestServeCached(t *testing.T) {
 
 	// Fill the cache.
 	reply := (&dns.Msg{
-		Answer: []dns.RR{newRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
+		Answer: []dns.RR{dnsproxytest.NewRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
 	}).SetReply(request)
 	reply.SetEdns0(defaultUDPBufSize, false)
 
 	dnsProxy.cache.set(request, reply, upstreamWithAddr, testLogger)
 
-	// Create a DNS-over-UDP client connection.
-	addr := dnsProxy.Addr(ProtoUDP)
+	addr := dnsProxy.Addr(ProtoTCP)
 	client := &dns.Client{
-		Net:     string(ProtoUDP),
-		Timeout: testTimeout,
+		Net:     string(ProtoTCP),
+		Timeout: dnsproxytest.Timeout,
 	}
 
 	r, _, err := client.Exchange(request, addr.String())
-	require.NoErrorf(t, err, "error in the first request: %s", err)
+	require.NoError(t, err)
 
 	requireEqualMsgs(t, r, reply)
 }
@@ -101,10 +102,8 @@ func TestCache_expired(t *testing.T) {
 		A: net.IP{8, 8, 8, 8},
 	}
 	reply := (&dns.Msg{
-		MsgHdr: dns.MsgHdr{
-			Response: true,
-		},
-		Answer: []dns.RR{ans},
+		Response: true,
+		Answer:   []dns.RR{ans},
 	}).SetQuestion(host, dns.TypeA)
 
 	testCases := []struct {
@@ -189,10 +188,8 @@ func TestCacheDO(t *testing.T) {
 
 	// Fill the cache.
 	reply := (&dns.Msg{
-		MsgHdr: dns.MsgHdr{
-			Response: true,
-		},
-		Answer: []dns.RR{newRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
+		Response: true,
+		Answer:   []dns.RR{dnsproxytest.NewRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
 	}).SetQuestion("google.com.", dns.TypeA)
 	reply.SetEdns0(4096, false)
 
@@ -227,10 +224,10 @@ func TestCacheCNAME(t *testing.T) {
 
 	// Fill the cache
 	reply := (&dns.Msg{
-		MsgHdr: dns.MsgHdr{
-			Response: true,
+		Response: true,
+		Answer: []dns.RR{
+			dnsproxytest.NewRR(t, "google.com.", dns.TypeCNAME, 3600, "test.google.com."),
 		},
-		Answer: []dns.RR{newRR(t, "google.com.", dns.TypeCNAME, 3600, "test.google.com.")},
 	}).SetQuestion("google.com.", dns.TypeA)
 	testCache.set(request, reply, upstreamWithAddr, testLogger)
 
@@ -241,7 +238,10 @@ func TestCacheCNAME(t *testing.T) {
 	})
 
 	// Now fill the cache with a cacheable CNAME response.
-	reply.Answer = append(reply.Answer, newRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8}))
+	reply.Answer = append(
+		reply.Answer,
+		dnsproxytest.NewRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8}),
+	)
 	testCache.set(request, reply, upstreamWithAddr, testLogger)
 
 	// We are testing that a proper CNAME response gets cached
@@ -306,30 +306,28 @@ func TestCacheExpiration(t *testing.T) {
 	t.Parallel()
 
 	dnsProxy := mustNew(t, &Config{
-		Logger:         testLogger,
-		UDPListenAddr:  []*net.UDPAddr{net.UDPAddrFromAddrPort(localhostAnyPort)},
-		TCPListenAddr:  []*net.TCPAddr{net.TCPAddrFromAddrPort(localhostAnyPort)},
-		UpstreamConfig: newTestUpstreamConfig(t, defaultTimeout, testDefaultUpstreamAddr),
-		TrustedProxies: defaultTrustedProxies,
+		Logger:        testLogger,
+		UDPListenAddr: []*net.UDPAddr{dnsproxytest.LocalhostAnyPortUDP},
+		TCPListenAddr: []*net.TCPAddr{dnsproxytest.LocalhostAnyPortTCP},
+		UpstreamConfig: &UpstreamConfig{
+			Upstreams: []upstream.Upstream{newTestUpstream(t)},
+		},
+		TrustedProxies: dnsproxytest.DefaultTrustedProxies,
 		CacheEnabled:   true,
 	})
 
-	servicetest.RequireRun(t, dnsProxy, testTimeout)
+	servicetest.RequireRun(t, dnsProxy, dnsproxytest.Timeout)
 
 	// Create dns messages with TTL of 1 second.
 	rrs := []dns.RR{
-		newRR(t, "youtube.com.", dns.TypeA, 1, net.IP{173, 194, 221, 198}),
-		newRR(t, "google.com.", dns.TypeA, 1, net.IP{8, 8, 8, 8}),
-		newRR(t, "yandex.com.", dns.TypeA, 1, net.IP{213, 180, 204, 62}),
+		dnsproxytest.NewRR(t, "youtube.com.", dns.TypeA, 1, net.IP{173, 194, 221, 198}),
+		dnsproxytest.NewRR(t, "google.com.", dns.TypeA, 1, net.IP{8, 8, 8, 8}),
+		dnsproxytest.NewRR(t, "yandex.com.", dns.TypeA, 1, net.IP{213, 180, 204, 62}),
 	}
 	requests := make([]*dns.Msg, 0, len(rrs))
 	responses := make([]*dns.Msg, 0, len(rrs))
 	for _, rr := range rrs {
-		req := (&dns.Msg{
-			MsgHdr: dns.MsgHdr{
-				Id: dns.Id(),
-			},
-		}).SetQuestion(rr.Header().Name, dns.TypeA)
+		req := (&dns.Msg{}).SetQuestion(rr.Header().Name, dns.TypeA)
 		requests = append(requests, req)
 
 		resp := (&dns.Msg{}).SetReply(req)
@@ -361,31 +359,34 @@ func TestCacheExpiration(t *testing.T) {
 }
 
 func TestCacheExpirationWithTTLOverride(t *testing.T) {
-	u := testUpstream{}
+	var ans []dns.RR
+
+	onExchange := newECSReplyHandler(&ans, nil, nil)
+	u := newTestUpstreamWithExchange(t, onExchange)
 
 	dnsProxy := mustNew(t, &Config{
 		Logger:        testLogger,
-		UDPListenAddr: []*net.UDPAddr{net.UDPAddrFromAddrPort(localhostAnyPort)},
-		TCPListenAddr: []*net.TCPAddr{net.TCPAddrFromAddrPort(localhostAnyPort)},
+		UDPListenAddr: []*net.UDPAddr{dnsproxytest.LocalhostAnyPortUDP},
+		TCPListenAddr: []*net.TCPAddr{dnsproxytest.LocalhostAnyPortTCP},
 		UpstreamConfig: &UpstreamConfig{
-			Upstreams: []upstream.Upstream{&u},
+			Upstreams: []upstream.Upstream{u},
 		},
-		TrustedProxies: defaultTrustedProxies,
+		TrustedProxies: dnsproxytest.DefaultTrustedProxies,
 		CacheEnabled:   true,
 		DNSSECEnabled:  true,
 		CacheMinTTL:    20,
 		CacheMaxTTL:    40,
 	})
 
-	servicetest.RequireRun(t, dnsProxy, testTimeout)
+	servicetest.RequireRun(t, dnsProxy, dnsproxytest.Timeout)
 
 	d := &DNSContext{}
 
 	t.Run("replace_min", func(t *testing.T) {
-		d.Req = newHostTestMessage("host")
+		d.Req = dnsproxytest.NewTestRequestWithHost("host")
 		d.Addr = netip.AddrPort{}
 
-		u.ans = []dns.RR{&dns.A{
+		ans = []dns.RR{&dns.A{
 			Hdr: dns.RR_Header{
 				Rrtype: dns.TypeA,
 				Name:   "host.",
@@ -402,14 +403,14 @@ func TestCacheExpirationWithTTLOverride(t *testing.T) {
 		assert.Equal(t, msgToKey(d.Req), key)
 
 		require.NotNil(t, ci)
-		assert.Equal(t, dnsProxy.CacheMinTTL, ci.m.Answer[0].Header().Ttl)
+		assert.Equal(t, dnsProxy.cacheMinTTL, ci.m.Answer[0].Header().Ttl)
 	})
 
 	t.Run("replace_max", func(t *testing.T) {
-		d.Req = newHostTestMessage("host2")
+		d.Req = dnsproxytest.NewTestRequestWithHost("host2")
 		d.Addr = netip.AddrPort{}
 
-		u.ans = []dns.RR{&dns.A{
+		ans = []dns.RR{&dns.A{
 			Hdr: dns.RR_Header{
 				Rrtype: dns.TypeA,
 				Name:   "host2.",
@@ -426,7 +427,7 @@ func TestCacheExpirationWithTTLOverride(t *testing.T) {
 		assert.Equal(t, msgToKey(d.Req), key)
 
 		require.NotNil(t, ci)
-		assert.Equal(t, dnsProxy.CacheMaxTTL, ci.m.Answer[0].Header().Ttl)
+		assert.Equal(t, dnsProxy.cacheMaxTTL, ci.m.Answer[0].Header().Ttl)
 	})
 }
 
@@ -453,13 +454,13 @@ func TestCache(t *testing.T) {
 		testCases{
 			cache: []testEntry{{
 				q: "google.com.",
-				a: []dns.RR{newRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
+				a: []dns.RR{dnsproxytest.NewRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
 				t: dns.TypeA,
 			}},
 			cases: []testCase{{
 				ok: require.True,
 				q:  "google.com.",
-				a:  []dns.RR{newRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
+				a:  []dns.RR{dnsproxytest.NewRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
 				t:  dns.TypeA,
 			}, {
 				ok: require.False,
@@ -473,23 +474,23 @@ func TestCache(t *testing.T) {
 		testCases{
 			cache: []testEntry{{
 				q: "gOOgle.com.",
-				a: []dns.RR{newRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
+				a: []dns.RR{dnsproxytest.NewRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
 				t: dns.TypeA,
 			}},
 			cases: []testCase{{
 				ok: require.True,
 				q:  "gOOgle.com.",
-				a:  []dns.RR{newRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
+				a:  []dns.RR{dnsproxytest.NewRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
 				t:  dns.TypeA,
 			}, {
 				ok: require.True,
 				q:  "google.com.",
-				a:  []dns.RR{newRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
+				a:  []dns.RR{dnsproxytest.NewRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
 				t:  dns.TypeA,
 			}, {
 				ok: require.True,
 				q:  "GOOGLE.COM.",
-				a:  []dns.RR{newRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
+				a:  []dns.RR{dnsproxytest.NewRR(t, "google.com.", dns.TypeA, 3600, net.IP{8, 8, 8, 8})},
 				t:  dns.TypeA,
 			}, {
 				q:  "gOOgle.com.",
@@ -511,7 +512,7 @@ func TestCache(t *testing.T) {
 		testCases{
 			cache: []testEntry{{
 				q: "gOOgle.com.",
-				a: []dns.RR{newRR(t, "google.com.", dns.TypeA, 0, net.IP{8, 8, 8, 8})},
+				a: []dns.RR{dnsproxytest.NewRR(t, "google.com.", dns.TypeA, 0, net.IP{8, 8, 8, 8})},
 				t: dns.TypeA,
 			}},
 			cases: []testCase{{
@@ -548,13 +549,7 @@ func (tests testCases) run(t *testing.T) {
 
 	for _, res := range tests.cache {
 		request := (&dns.Msg{}).SetQuestion(res.q, res.t)
-
-		reply := (&dns.Msg{
-			MsgHdr: dns.MsgHdr{
-				Response: true,
-			},
-			Answer: res.a,
-		}).SetReply(request)
+		reply := (&dns.Msg{Response: true, Answer: res.a}).SetReply(request)
 		testCache.set(request, reply, upstreamWithAddr, testLogger)
 	}
 
@@ -571,12 +566,7 @@ func (tests testCases) run(t *testing.T) {
 			continue
 		}
 
-		reply := (&dns.Msg{
-			MsgHdr: dns.MsgHdr{
-				Response: true,
-			},
-			Answer: tc.a,
-		}).SetQuestion(tc.q, tc.t)
+		reply := (&dns.Msg{Response: true, Answer: tc.a}).SetQuestion(tc.q, tc.t)
 
 		testCache.set(request, reply, upstreamWithAddr, testLogger)
 
@@ -618,17 +608,11 @@ func setAndGetCache(t *testing.T, c *cache, g *sync.WaitGroup, host, ip string) 
 
 	ipAddr := net.ParseIP(ip)
 
-	req := (&dns.Msg{
-		MsgHdr: dns.MsgHdr{
-			Id: dns.Id(),
-		},
-	}).SetQuestion(host, dns.TypeA)
+	req := (&dns.Msg{}).SetQuestion(host, dns.TypeA)
 
 	dnsMsg := (&dns.Msg{
-		MsgHdr: dns.MsgHdr{
-			Response: true,
-		},
-		Answer: []dns.RR{newRR(t, host, dns.TypeA, 1, ipAddr)},
+		Response: true,
+		Answer:   []dns.RR{dnsproxytest.NewRR(t, host, dns.TypeA, 1, ipAddr)},
 	}).SetQuestion(host, dns.TypeA)
 
 	c.set(req, dnsMsg, upstreamWithAddr, testLogger)
@@ -668,7 +652,7 @@ func TestCache_getWithSubnet(t *testing.T) {
 
 	// Add a response with subnet.
 	resp := (&dns.Msg{
-		Answer: []dns.RR{newRR(t, testFQDN, dns.TypeA, 1, net.IP{1, 1, 1, 1})},
+		Answer: []dns.RR{dnsproxytest.NewRR(t, testFQDN, dns.TypeA, 1, net.IP{1, 1, 1, 1})},
 	}).SetReply(req)
 	c.setWithSubnet(req, resp, upstreamWithAddr, &net.IPNet{IP: ip1234, Mask: mask16}, testLogger)
 
@@ -681,13 +665,13 @@ func TestCache_getWithSubnet(t *testing.T) {
 
 	// Add a response entry with subnet #2.
 	resp = (&dns.Msg{
-		Answer: []dns.RR{newRR(t, testFQDN, dns.TypeA, 1, net.IP{2, 2, 2, 2})},
+		Answer: []dns.RR{dnsproxytest.NewRR(t, testFQDN, dns.TypeA, 1, net.IP{2, 2, 2, 2})},
 	}).SetReply(req)
 	c.setWithSubnet(req, resp, upstreamWithAddr, &net.IPNet{IP: ip2234, Mask: mask16}, testLogger)
 
 	// Add a response entry without subnet.
 	resp = (&dns.Msg{
-		Answer: []dns.RR{newRR(t, testFQDN, dns.TypeA, 1, net.IP{3, 3, 3, 3})},
+		Answer: []dns.RR{dnsproxytest.NewRR(t, testFQDN, dns.TypeA, 1, net.IP{3, 3, 3, 3})},
 	}).SetReply(req)
 	c.setWithSubnet(req, resp, upstreamWithAddr, &net.IPNet{IP: nil, Mask: nil}, testLogger)
 
@@ -751,7 +735,7 @@ func TestCache_getWithSubnet_mask(t *testing.T) {
 
 	req := (&dns.Msg{}).SetQuestion(testFQDN, dns.TypeA)
 	resp := (&dns.Msg{
-		Answer: []dns.RR{newRR(t, testFQDN, dns.TypeA, 300, ansIP)},
+		Answer: []dns.RR{dnsproxytest.NewRR(t, testFQDN, dns.TypeA, 300, ansIP)},
 	}).SetReply(req)
 
 	// Cache IP network that contains the testIP.
